@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web地磁室內定位系統</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 15px; margin: 0; background: #f4f6f8; }
+        .card { background: white; padding: 15px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 15px; }
+        h2 { margin-top: 0; font-size: 1.1rem; color: #333; }
+        button { background: #007aff; color: white; border: none; padding: 10px 15px; border-radius: 6px; font-size: 1rem; cursor: pointer; width: 100%; margin-top: 5px; }
+        button:active { background: #0056b3; }
+        input { width: 100%; padding: 8px; margin-top: 5px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        .data-display { font-family: monospace; background: #eef2f5; padding: 8px; border-radius: 4px; margin-top: 8px; word-break: break-all; }
+        .result { font-weight: bold; color: #28a745; font-size: 1.2rem; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h2>1. 感測器權限與狀態</h2>
+        <button onclick="requestSensorPermission()">開啟感測器權限</button>
+        <div class="data-display" id="sensorStatus">狀態: 待啟動...</div>
+        <div class="data-display" id="rawMag">X: 0 | Y: 0 | Z: 0 | 強度: 0 µT</div>
+    </div>
+
+    <div class="card">
+        <h2>2. 地磁指紋採集 (Fingerprinting)</h2>
+        <label for="locationName">當前位置標籤 (例如: 客廳, A區-1):</label>
+        <input type="text" id="locationName" placeholder="輸入位置名稱">
+        <button onclick="recordFingerprint()">採集當前地磁資料</button>
+        <div class="data-display" id="fingerprintCount">已記錄指紋數: 0</div>
+    </div>
+
+    <div class="card">
+        <h2>3. 即時定位比對 (Positioning)</h2>
+        <button onclick="startPositioning()" style="background:#28a745;">開始即時定位</button>
+        <div class="data-display">推測目前位置: <span class="result" id="currentLocation">未定位</span></div>
+    </div>
+
+    <script>
+        let currentMag = { x: 0, y: 0, z: 0, B: 0 };
+        let fingerprints = JSON.parse(localStorage.getItem('geomagnetic_db') || '[]');
+        let isPositioning = false;
+
+        document.getElementById('fingerprintCount').innerText = `已記錄指紋數: ${fingerprints.length}`;
+
+        // 1. 請求感測器權限與監聽磁力計
+        async function requestSensorPermission() {
+            const statusEl = document.getElementById('sensorStatus');
+            
+            // 處理 iOS 13+ 裝置特有的 Sensor 權限請求
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                try {
+                    const response = await DeviceOrientationEvent.requestPermission();
+                    if (response === 'granted') {
+                        initMagnetometer();
+                    } else {
+                        statusEl.innerText = '權限被拒絕';
+                    }
+                } catch (e) {
+                    statusEl.innerText = '權限請求失敗: ' + e.message;
+                }
+            } else {
+                // 標準 Generic Sensor API 或 Android 裝置
+                initMagnetometer();
+            }
+        }
+
+        function initMagnetometer() {
+            const statusEl = document.getElementById('sensorStatus');
+            
+            if ('Magnetometer' in window) {
+                try {
+                    const magSensor = new Magnetometer({ frequency: 10 });
+                    magSensor.addEventListener('reading', () => {
+                        const x = magSensor.x;
+                        const y = magSensor.y;
+                        const z = magSensor.z;
+                        // 計算地磁場總強度 B = sqrt(x^2 + y^2 + z^2)
+                        const B = Math.sqrt(x * x + y * y + z * z);
+
+                        currentMag = { x, y, z, B };
+                        updateUI();
+                    });
+                    magSensor.start();
+                    statusEl.innerText = '狀態: Magnetometer API 運行中';
+                } catch (err) {
+                    fallbackDeviceMotion(statusEl);
+                }
+            } else {
+                fallbackDeviceMotion(statusEl);
+            }
+        }
+
+        // 後備方案：利用 devicemotion 估算 (當瀏覽器不支援 Magnetometer API 時)
+        function fallbackDeviceMotion(statusEl) {
+            statusEl.innerText = '狀態: 使用 DeviceOrientation 降級相容模式';
+            window.addEventListener('deviceorientation', (event) => {
+                // 模擬相對地磁變化 (Alpha: 方位角, Beta: 俯仰角, Gamma: 翻滾角)
+                const alpha = event.alpha || 0;
+                const beta = event.beta || 0;
+                const gamma = event.gamma || 0;
+                const B = Math.sqrt(alpha*alpha + beta*beta + gamma*gamma);
+                
+                currentMag = { x: alpha, y: beta, z: gamma, B };
+                updateUI();
+            });
+        }
+
+        function updateUI() {
+            document.getElementById('rawMag').innerText = 
+                `X: ${currentMag.x.toFixed(1)} | Y: ${currentMag.y.toFixed(1)} | Z: ${currentMag.z.toFixed(1)} | 強度: ${currentMag.B.toFixed(1)} µT`;
+            
+            if (isPositioning) {
+                matchLocation();
+            }
+        }
+
+        // 2. 記錄指紋點位
+        function recordFingerprint() {
+            const name = document.getElementById('locationName').value.trim();
+            if (!name) {
+                alert('請輸入位置名稱！');
+                return;
+            }
+
+            const record = {
+                location: name,
+                x: currentMag.x,
+                y: currentMag.y,
+                z: currentMag.z,
+                B: currentMag.B,
+                timestamp: Date.now()
+            };
+
+            fingerprints.push(record);
+            localStorage.setItem('geomagnetic_db', JSON.stringify(fingerprints));
+            document.getElementById('fingerprintCount').innerText = `已記錄指紋數: ${fingerprints.length}`;
+            alert(`已儲存 [${name}] 的地磁特徵！`);
+        }
+
+        // 3. KNN 歐幾里得距離比對演算法
+        function matchLocation() {
+            if (fingerprints.length === 0) {
+                document.getElementById('currentLocation').innerText = '請先建立指紋庫';
+                return;
+            }
+
+            let minDistance = Infinity;
+            let closestLocation = '未知';
+
+            fingerprints.forEach(fp => {
+                // 計算 4 維地磁向量 (X, Y, Z, Total Strength B) 之歐式距離
+                const distance = Math.sqrt(
+                    Math.pow(currentMag.x - fp.x, 2) +
+                    Math.pow(currentMag.y - fp.y, 2) +
+                    Math.pow(currentMag.z - fp.z, 2) +
+                    Math.pow(currentMag.B - fp.B, 2)
+                );
+
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    closestLocation = fp.location;
+                }
+            });
+
+            document.getElementById('currentLocation').innerText = `${closestLocation} (誤差指標: ${minDistance.toFixed(2)})`;
+        }
+
+        function startPositioning() {
+            isPositioning = true;
+            alert('即時定位比對已開啟');
+        }
+    </script>
+</body>
+</html>
